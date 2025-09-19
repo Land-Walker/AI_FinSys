@@ -14,12 +14,17 @@ END_DATE = "2023-12-31"
 os.makedirs('data/raw', exist_ok=True)
 
 # ==============================
-#     YFINANCE DATA LOADER
-# ==============================
+#     1. YFINANCE DATA LOADER
+# ============================== 
 # --- 1. Download Stock Data ---
 print(f"Downloading stock data for {TICKER}...")
 stock_data = yf.download(TICKER, start=START_DATE, end=END_DATE)
+stock_df = stock_data[['Open']].rename(columns={'Open': 'open'})
+stock_df = stock_data[['High']].rename(columns={'High': 'high'})
+stock_df = stock_data[['Low']].rename(columns={'Low': 'low'})
 stock_df = stock_data[['Close']].rename(columns={'Close': 'close'})
+stock_df = stock_data[['Volume']].rename(columns={'Volume': 'volume'})
+stock_df = stock_df.reset_index() # <-- FIX: Convert the date index into a column
 stock_df.to_csv('data/raw/stock_data.csv')
 print("✅ Saved stock_data.csv")
 
@@ -27,6 +32,7 @@ print("✅ Saved stock_data.csv")
 print(f"Downloading macro proxy data for {MACRO_TICKER}...")
 macro_data = yf.download(MACRO_TICKER, start=START_DATE, end=END_DATE)
 macro_df = macro_data[['Close']].rename(columns={'Close': 'interest_rate'})
+macro_df = macro_df.reset_index()
 # We will add more macro data in the next step
 # For now, let's start with this one file
 macro_df.to_csv('data/raw/macro_data.csv') 
@@ -34,7 +40,7 @@ print("✅ Saved macro_data.csv (partial)")
 
 
 # ==============================
-#     FRED DATA LOADER
+#     2. FRED DATA LOADER
 # ==============================
 # FRED series codes
 # You can find more codes on the FRED website
@@ -53,40 +59,57 @@ fred_df = fred_df.rename(columns=fred_series)
 fred_df = fred_df.ffill() 
 
 # --- Save to CSV ---
+fred_df = fred_df.reset_index().rename(columns={'index': 'date'}) # <-- FIX: Convert index and rename
 fred_df.to_csv('data/raw/macro_data.csv')
 print("✅ Saved macro_data.csv (complete) from FRED")
 
 
 # ==============================
-#     LABEL DATA LOADER
+#      3. SCENARIO LABELS
 # ==============================
-# --- Configuration ---
-# Use the stock data we downloaded earlier as the basis for our labels
-STOCK_DATA_PATH = 'data/raw/stock_data.csv'
+print("Generating scenario labels...")
+
+# 💡 NEW LOGIC: Check if the main ticker is the S&P 500
+if TICKER != "^GSPC":
+    print(f"Ticker '{TICKER}' is not S&P 500. Downloading ^GSPC separately for market labels...")
+    sp500_data = yf.download("^GSPC", start=START_DATE, end=END_DATE)
+    df_for_labels = sp500_data[['Close']].rename(columns={'Close': 'close'})
+    df_for_labels = df_for_labels.reset_index().rename(columns={'Date': 'date'})
+else:
+    print("Ticker is S&P 500. Using its own data for market labels...")
+    # Use the DataFrame we already loaded
+    df_for_labels = stock_df.copy()
+
+
+# --- Define Rules and Apply (This part remains the same) ---
+df_for_labels['date'] = pd.to_datetime(df_for_labels['Date'])
+df_for_labels = df_for_labels.set_index('date')
+
+# Check if columns have a MultiIndex and flatten if necessary
+if isinstance(df_for_labels.columns, pd.MultiIndex):
+    print("Detected MultiIndex in columns. Flattening...")
+    df_for_labels.columns = [col[0] if col[1] == '^GSPC' else col[0] for col in df_for_labels.columns]
+else:
+    print("No MultiIndex detected in columns.")
+
 MOVING_AVERAGE_WINDOW = 200
-# Define the threshold: e.g., 5% above the MA is "bull", 5% below is "bear"
-THRESHOLD = 0.05 
+THRESHOLD = 0.05
 
-# --- Load S&P 500 Data ---
-df = pd.read_csv(STOCK_DATA_PATH, parse_dates=['date'], index_col='date')
+# Calculate moving average
+df_for_labels['ma'] = df_for_labels['close'].rolling(window=MOVING_AVERAGE_WINDOW).mean()
 
-# --- 1. Calculate the Moving Average ---
-df['ma'] = df['close'].rolling(window=MOVING_AVERAGE_WINDOW).mean()
-df = df.dropna() # Remove initial rows where MA is not available
-
-# --- 2. Define the Rule and Apply it ---
+# No need for align, as 'close' and 'ma' should have the same index
 conditions = [
-    (df['close'] > df['ma'] * (1 + THRESHOLD)),  # Bull condition
-    (df['close'] < df['ma'] * (1 - THRESHOLD)),  # Bear condition
+    df_for_labels['close'] > df_for_labels['ma'] * (1 + THRESHOLD),  # Bull
+    df_for_labels['close'] < df_for_labels['ma'] * (1 - THRESHOLD),  # Bear
 ]
+
 choices = ['bull', 'bear']
+df_for_labels['label'] = np.select(conditions, choices, default='neutral')
 
-# numpy.select is a great way to apply conditional logic
-df['label'] = np.select(conditions, choices, default='neutral')
-
-# --- 3. Save the Labels File ---
-labels_df = df[['label']].reset_index()
-labels_df.to_csv('data/raw/scenario_labels.csv', index=False)
+# --- Save the Labels File ---
+labels_df = df_for_labels[['label']].reset_index()
+labels_df.to_csv('data/raw/macro_data.csv')
 
 print("✅ Saved scenario_labels.csv")
 print("\nLabel distribution:")
